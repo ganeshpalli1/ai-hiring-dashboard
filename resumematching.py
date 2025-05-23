@@ -713,8 +713,542 @@ class ResumeAnalyzer:
             logger.error(f"Full error details: {traceback.format_exc()}")
             raise
 
-# Continue with remaining classes and application code...
-# [The file is quite long, so I'll create it in parts]
+# Batch Processor
+class BatchProcessor:
+    """Handle batch processing of resumes"""
+    
+    def __init__(self):
+        self.openai_client = AzureOpenAIClient()
+        self.resume_analyzer = ResumeAnalyzer(self.openai_client)
+        self.executor = ThreadPoolExecutor(max_workers=Config.MAX_CONCURRENT_REQUESTS)
+    
+    async def process_batch(self, job_id: str, resumes: List[Tuple[str, str, str]], 
+                          job_analysis: Dict[str, Any], job_description: str) -> List[ResumeAnalysisResult]:
+        """Process a batch of resumes"""
+        
+        results = []
+        tasks = []
+        
+        for resume_id, filename, resume_text in resumes:
+            task = self.process_single_resume(
+                resume_id, filename, resume_text, job_id, job_analysis, job_description
+            )
+            tasks.append(task)
+        
+        # Process in parallel with limited concurrency
+        completed = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for i, result in enumerate(completed):
+            if isinstance(result, Exception):
+                logger.error(f"Batch processing error for task {i}: {str(result)}")
+                logger.error(f"Full error: {traceback.format_exc()}")
+            else:
+                results.append(result)
+                logger.debug(f"Successfully processed task {i}: {result.filename if hasattr(result, 'filename') else 'unknown'}")
+        
+        logger.info(f"Batch completed: {len(results)} successful, {len([r for r in completed if isinstance(r, Exception)])} failed")
+        return results
+    
+    async def process_single_resume(self, resume_id: str, filename: str, resume_text: str, 
+                                  job_id: str, job_analysis: Dict[str, Any], 
+                                  job_description: str) -> ResumeAnalysisResult:
+        """Process a single resume with classification"""
+        
+        with processing_time_histogram.time():
+            try:
+                # First, classify the resume
+                classification = await self.resume_analyzer.classify_resume(resume_text)
+                
+                # Then analyze it against the job
+                analysis = await self.resume_analyzer.analyze_resume(
+                    resume_text, job_analysis, job_description, classification
+                )
+                
+                # Extract results
+                result = ResumeAnalysisResult(
+                    resume_id=resume_id,
+                    filename=filename,
+                    classification=classification,
+                    fit_score=analysis['fit_score'],
+                    matching_skills=analysis['matching_skills'] if isinstance(analysis['matching_skills'], list) else self._flatten_skills(analysis['matching_skills']),
+                    missing_skills=analysis['missing_skills'] if isinstance(analysis['missing_skills'], list) else self._flatten_skills(analysis['missing_skills']),
+                    recommendation=analysis['recommendation'],
+                    detailed_analysis=analysis
+                )
+                
+                # Store result
+                storage.add_resume_analysis(job_id, result.dict())
+                
+                resume_processed_counter.inc()
+                logger.info(f"Processed resume {filename}: {classification.category}/{classification.level} - Score: {analysis['fit_score']}")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"Error processing resume {resume_id} ({filename}): {str(e)}")
+                logger.error(f"Full error: {traceback.format_exc()}")
+                
+                # Create a fallback result instead of failing completely
+                fallback_classification = ResumeClassification(
+                    category="tech",
+                    level="mid", 
+                    confidence=0.5
+                )
+                
+                fallback_result = ResumeAnalysisResult(
+                    resume_id=resume_id,
+                    filename=filename,
+                    classification=fallback_classification,
+                    fit_score=50.0,
+                    matching_skills=["Analysis failed - manual review required"],
+                    missing_skills=["Could not analyze due to processing error"],
+                    recommendation="MANUAL_REVIEW",
+                    detailed_analysis={
+                        "error": str(e),
+                        "status": "processing_failed",
+                        "note": "This resume could not be automatically analyzed. Manual review recommended."
+                    }
+                )
+                
+                # Store fallback result using .dict() for Pydantic models
+                storage.add_resume_analysis(job_id, fallback_result.dict())
+                
+                resume_processed_counter.inc()
+                logger.warning(f"Created fallback result for {filename} due to processing error")
+                
+                return fallback_result
+    
+    def _flatten_skills(self, skills_dict: Dict[str, List[str]]) -> List[str]:
+        """Flatten nested skills dictionary"""
+        flattened = []
+        try:
+            if isinstance(skills_dict, dict):
+                for category, skills in skills_dict.items():
+                    if isinstance(skills, list):
+                        flattened.extend(skills)
+                    elif isinstance(skills, str):
+                        flattened.append(skills)
+                    else:
+                        logger.warning(f"Unexpected skill format in category {category}: {type(skills)}")
+            elif isinstance(skills_dict, list):
+                # If it's already a list, return as-is
+                flattened = skills_dict
+            else:
+                logger.warning(f"Unexpected skills format: {type(skills_dict)}")
+                flattened = ["Analysis format error"]
+        except Exception as e:
+            logger.error(f"Error flattening skills: {str(e)}")
+            flattened = ["Error extracting skills"]
+        
+        return flattened
+
+# Background task processor
+async def process_resumes_background(job_id: str, file_contents: List[Dict]):
+    """Background task to process resumes"""
+    
+    active_jobs_gauge.inc()
+    
+    try:
+        job_data = storage.get_job(job_id)
+        if not job_data or not job_data.get("analysis"):
+            logger.error(f"Job {job_id} not found or not analyzed")
+            return
+        
+        parser = ResumeParser()
+        processor = BatchProcessor()
+        
+        # Parse resumes with better error handling
+        resumes_data = []
+        successfully_parsed = 0
+        failed_files = []
+        
+        for file_data in file_contents:
+            filename = file_data["filename"]
+            content = file_data["content"]
+            
+            try:
+                logger.info(f"Processing file: {filename} ({len(content)} bytes)")
+                resume_text = parser.extract_text(content, filename)
+                
+                # Validate that we got some text
+                if not resume_text or len(resume_text.strip()) < 10:
+                    logger.warning(f"File {filename} produced very little text: {len(resume_text)} characters")
+                    failed_files.append(f"{filename} (insufficient content)")
+                    continue
+                
+                resume_id = str(uuid.uuid4())
+                resumes_data.append((resume_id, filename, resume_text))
+                successfully_parsed += 1
+                logger.info(f"Successfully parsed {filename}: {len(resume_text)} characters extracted")
+                
+            except Exception as e:
+                logger.error(f"Error parsing file {filename}: {str(e)}")
+                logger.error(f"Full error: {traceback.format_exc()}")
+                failed_files.append(f"{filename} ({str(e)})")
+        
+        # Update total count with successfully parsed resumes
+        storage.increment_total_resumes(job_id, len(resumes_data))
+        
+        if not resumes_data:
+            logger.error(f"No resumes could be parsed for job {job_id}")
+            return
+        
+        logger.info(f"Successfully parsed {successfully_parsed} out of {len(file_contents)} files for job {job_id}")
+        if failed_files:
+            logger.warning(f"Failed to parse files: {failed_files}")
+        
+        # Process in batches
+        for i in range(0, len(resumes_data), Config.BATCH_SIZE):
+            batch = resumes_data[i:i + Config.BATCH_SIZE]
+            try:
+                await processor.process_batch(
+                    job_id, batch, job_data["analysis"], job_data["description"]
+                )
+                logger.info(f"Processed batch {i//Config.BATCH_SIZE + 1} for job {job_id}")
+            except Exception as e:
+                logger.error(f"Error processing batch {i//Config.BATCH_SIZE + 1}: {str(e)}")
+            
+    except Exception as e:
+        logger.error(f"Background processing error for job {job_id}: {str(e)}")
+        logger.error(f"Full error: {traceback.format_exc()}")
+    finally:
+        active_jobs_gauge.dec()
+
+# FastAPI Application
+app = FastAPI(title="Resume Screening System with Classification", version="2.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:8080", "http://localhost:5173"],  # React development servers
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.post("/api/jobs", response_model=Dict[str, str])
+async def create_job(job_input: JobDescriptionInput, background_tasks: BackgroundTasks):
+    """Create a new job posting and analyze it"""
+    
+    try:
+        job_id = str(uuid.uuid4())
+        
+        # Store job
+        storage.create_job(job_id, {
+            "job_role": job_input.job_role,
+            "required_experience": job_input.required_experience,
+            "description": job_input.description
+        })
+        
+        # Analyze job in background
+        background_tasks.add_task(analyze_job_background, job_id)
+        
+        return {"job_id": job_id, "status": "Job created and analysis started"}
+        
+    except Exception as e:
+        logger.error(f"Error creating job: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create job")
+
+async def analyze_job_background(job_id: str):
+    """Background task to analyze job description"""
+    
+    try:
+        job_data = storage.get_job(job_id)
+        if not job_data:
+            return
+        
+        openai_client = AzureOpenAIClient()
+        job_analyzer = JobAnalyzer(openai_client)
+        
+        analysis = await job_analyzer.analyze_job_description(
+            job_data["job_role"], 
+            job_data["required_experience"], 
+            job_data["description"]
+        )
+        
+        storage.update_job_analysis(job_id, analysis)
+        logger.info(f"Job {job_id} analyzed successfully")
+            
+    except Exception as e:
+        logger.error(f"Error analyzing job {job_id}: {str(e)}")
+
+@app.post("/api/jobs/{job_id}/resumes")
+async def upload_resumes(
+    job_id: str,
+    files: List[UploadFile] = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    """Upload resumes for a job"""
+    
+    # Verify job exists and is analyzed
+    job_data = storage.get_job(job_id)
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    if not job_data.get("analysis"):
+        raise HTTPException(status_code=400, detail="Job analysis not complete. Please wait and try again.")
+    
+    # Read file contents immediately before they get closed
+    file_contents = []
+    successfully_read = 0
+    
+    for file in files:
+        try:
+            content = await file.read()
+            if content:
+                file_contents.append({
+                    "filename": file.filename,
+                    "content": content,
+                    "content_type": file.content_type
+                })
+                successfully_read += 1
+                logger.info(f"Successfully read file {file.filename}: {len(content)} bytes")
+            else:
+                logger.warning(f"File {file.filename} is empty")
+        except Exception as e:
+            logger.error(f"Error reading file {file.filename}: {str(e)}")
+    
+    if not file_contents:
+        raise HTTPException(status_code=400, detail="No valid files could be read")
+    
+    # Process resumes in background with file contents
+    background_tasks.add_task(process_resumes_background, job_id, file_contents)
+    
+    return {
+        "job_id": job_id,
+        "resumes_uploaded": len(file_contents),
+        "files_read": successfully_read,
+        "total_files": len(files),
+        "status": "Processing started"
+    }
+
+@app.get("/api/jobs/{job_id}/results")
+async def get_job_results(
+    job_id: str,
+    min_score: Optional[float] = None,
+    category: Optional[str] = None,
+    level: Optional[str] = None,
+    limit: Optional[int] = 100,
+    offset: Optional[int] = 0
+):
+    """Get analysis results for a job with filtering options"""
+    
+    # Verify job exists
+    if not storage.get_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Get results
+    results = storage.get_results(job_id, min_score)
+    
+    # Apply filters
+    if category:
+        results = [r for r in results if r.get("classification", {}).get("category") == category]
+    if level:
+        results = [r for r in results if r.get("classification", {}).get("level") == level]
+    
+    # Apply pagination
+    total = len(results)
+    results = results[offset:offset + limit]
+    
+    # Get classification summary
+    classification_summary = defaultdict(lambda: defaultdict(int))
+    all_results = storage.get_results(job_id)
+    for r in all_results:
+        cat = r.get("classification", {}).get("category", "unknown")
+        lvl = r.get("classification", {}).get("level", "unknown")
+        classification_summary[cat][lvl] += 1
+    
+    return {
+        "job_id": job_id,
+        "total_results": total,
+        "offset": offset,
+        "limit": limit,
+        "classification_summary": dict(classification_summary),
+        "results": results
+    }
+
+@app.get("/api/jobs/{job_id}/status")
+async def get_job_status(job_id: str):
+    """Get processing status for a job"""
+    
+    # Verify job exists
+    if not storage.get_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    status = storage.get_status(job_id)
+    
+    return {
+        "job_id": job_id,
+        "total_resumes": status["total"],
+        "processed_resumes": status["processed"],
+        "pending_resumes": status["total"] - status["processed"],
+        "completion_percentage": (status["processed"] / status["total"] * 100) if status["total"] > 0 else 0
+    }
+
+@app.get("/api/jobs/{job_id}")
+async def get_job_details(job_id: str):
+    """Get job details including analysis"""
+    
+    job_data = storage.get_job(job_id)
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return job_data
+
+@app.post("/api/test-file-upload")
+async def test_file_upload(files: List[UploadFile] = File(...)):
+    """Test endpoint to verify file upload and processing"""
+    try:
+        results = []
+        parser = ResumeParser()
+        
+        for file in files:
+            try:
+                content = await file.read()
+                if content:
+                    text = parser.extract_text(content, file.filename)
+                    results.append({
+                        "filename": file.filename,
+                        "size": len(content),
+                        "text_length": len(text),
+                        "text_preview": text[:200] if text else "No text extracted",
+                        "status": "success"
+                    })
+                else:
+                    results.append({
+                        "filename": file.filename,
+                        "status": "error",
+                        "error": "Empty file"
+                    })
+            except Exception as e:
+                results.append({
+                    "filename": file.filename,
+                    "status": "error", 
+                    "error": str(e)
+                })
+        
+        return {
+            "status": "success",
+            "files_processed": len(results),
+            "results": results
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+@app.get("/api/test-openai")
+async def test_openai_connection():
+    """Test endpoint to verify OpenAI connection"""
+    try:
+        openai_client = AzureOpenAIClient()
+        test_messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Respond with a simple JSON object: {\"status\": \"ok\", \"message\": \"Connection successful\"}"}
+        ]
+        
+        response = await openai_client.complete(test_messages)
+        
+        return {
+            "status": "success",
+            "response_length": len(response) if response else 0,
+            "response_preview": response[:200] if response else "Empty response",
+            "config": {
+                "endpoint": Config.AZURE_OPENAI_ENDPOINT,
+                "deployment": Config.AZURE_OPENAI_DEPLOYMENT,
+                "api_version": Config.AZURE_OPENAI_API_VERSION
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"OpenAI test failed: {str(e)}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "config": {
+                "endpoint": Config.AZURE_OPENAI_ENDPOINT,
+                "deployment": Config.AZURE_OPENAI_DEPLOYMENT,
+                "api_version": Config.AZURE_OPENAI_API_VERSION
+            }
+        }
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "active_jobs": active_jobs_gauge._value.get()
+    }
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint"""
+    return Response(generate_latest(), media_type="text/plain")
+
+@app.get("/api/test-json-repair")
+async def test_json_repair():
+    """Test endpoint to verify JSON repair functionality"""
+    try:
+        analyzer = ResumeAnalyzer(AzureOpenAIClient())
+        
+        # Test cases for JSON repair
+        test_cases = [
+            # Missing closing brace
+            '{"test": "value", "array": [1, 2, 3]',
+            # Trailing comma
+            '{"test": "value", "array": [1, 2, 3,]}',
+            # Multiple issues
+            '{"test": "value", "array": [1, 2, 3,], "incomplete": "data"',
+        ]
+        
+        results = []
+        for i, broken_json in enumerate(test_cases):
+            try:
+                repaired = analyzer._repair_json(broken_json)
+                # Try to parse the repaired JSON
+                parsed = json.loads(repaired)
+                results.append({
+                    f"test_{i+1}": {
+                        "original": broken_json,
+                        "repaired": repaired,
+                        "parsed_successfully": True,
+                        "parsed_data": parsed
+                    }
+                })
+            except Exception as e:
+                results.append({
+                    f"test_{i+1}": {
+                        "original": broken_json,
+                        "repaired": repaired if 'repaired' in locals() else "repair_failed",
+                        "parsed_successfully": False,
+                        "error": str(e)
+                    }
+                })
+        
+        return {
+            "status": "success",
+            "message": "JSON repair functionality tested",
+            "results": results
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+# Error handlers
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"}
+    )
 
 if __name__ == "__main__":
     # Validate environment variables
